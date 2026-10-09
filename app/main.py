@@ -473,7 +473,9 @@ def regularize(emp_code: str, day: Annotated[DateStr, Path(alias="date")], body:
     if record is None:
         raise HTTPException(404, f"no attendance record for {emp_code} on {day}")
 
-    old = {field: record.get(field, FIELD_DEFAULTS.get(field)) for field in TRACKED_FIELDS}
+    # Missing or null derived fields in seeded data mean their defaults, so they do not show up as "changes".
+    old = {field: record.get(field) for field in TRACKED_FIELDS}
+    old.update({field: default for field, default in FIELD_DEFAULTS.items() if old[field] is None})
     old["half_day"] = bool(old["half_day"])
     status = body.status or old["status"]
     if status in PRESENCE_STATUSES:
