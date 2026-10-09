@@ -21,10 +21,10 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 log = logging.getLogger("attendance")
@@ -250,6 +250,28 @@ class PunchInRequest(BaseModel):
     status: PresenceStatus = "PRESENT"
 
 
+class PunchOutRequest(BaseModel):
+    emp_code: Annotated[str, Field(min_length=1)]
+    punched_at: Optional[EpochMillis] = None
+
+
+class RegularizeRequest(BaseModel):
+    """Only status and the punch times can be corrected; derived fields sent by a client are ignored."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: Annotated[str, Field(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
+
+    @model_validator(mode="after")
+    def _no_explicit_nulls(self):
+        # The fields are optional but not nullable: "omitted" means unchanged, an explicit null is invalid.
+        for field in ("status", "punch_in", "punch_out"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} may be omitted but not null")
+        return self
+
+
 # --------------------------------------------------------------------------- #
 # 4. Serialisation (MongoDB documents -> API JSON)
 # --------------------------------------------------------------------------- #
@@ -395,3 +417,94 @@ def list_attendance(
     # An unfiltered count over ~100k documents is answered from collection metadata instead of a scan.
     total = attendance.count_documents(query) if query else attendance.estimated_document_count()
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutRequest):
+    emp = get_employee_or_404(body.emp_code)
+    punched = ms_to_datetime(body.punched_at) if body.punched_at is not None else utc_now()
+    # The latest record that started at or before this punch-out. Looking up by punch_in rather than by today's
+    # date is what makes an overnight shift (in at 22:00, out at 06:40 the next day) close the right record.
+    record = attendance.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": punched}},
+        sort=[("punch_in", -1)],
+    )
+    if record is None:
+        raise HTTPException(404, f"no punch-in found for {body.emp_code} at or before this time")
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, f"the record of {record['date']} is already punched out")
+    if punched <= record["punch_in"]:
+        validation_error(("body", "punched_at"), "punched_at must be after punch_in", body.punched_at)
+    if punched - record["punch_in"] > MAX_SHIFT_LENGTH:
+        validation_error(("body", "punched_at"), "punched_at is more than 24 hours after punch_in", body.punched_at)
+
+    day = date.fromisoformat(record["date"])
+    update = {"punch_out": punched, **derived_fields(record["status"], record["punch_in"], punched, day, emp)}
+    # Conditional update: only one of several simultaneous punch-outs can still see punch_out == null.
+    updated = attendance.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": update},
+        projection=RECORD_PROJECTION,
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, f"the record of {record['date']} is already punched out")
+    return record_out(updated)
+
+
+CORRECTABLE_FIELDS = ("status", "punch_in", "punch_out")
+TRACKED_FIELDS = CORRECTABLE_FIELDS + ("work_hours", "late_minutes", "overtime_minutes", "half_day")
+FIELD_DEFAULTS = {"punch_in": None, "punch_out": None, "work_hours": None, "late_minutes": 0,
+                  "overtime_minutes": 0, "half_day": False}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, day: Annotated[DateStr, Path(alias="date")], body: RegularizeRequest):
+    emp = get_employee_or_404(emp_code)
+    record = attendance.find_one({"emp_code": emp_code, "date": day})
+    if record is None:
+        raise HTTPException(404, f"no attendance record for {emp_code} on {day}")
+
+    old = {field: record.get(field, FIELD_DEFAULTS.get(field)) for field in TRACKED_FIELDS}
+    old["half_day"] = bool(old["half_day"])
+    status = body.status or old["status"]
+    if status in PRESENCE_STATUSES:
+        punch_in_at = ms_to_datetime(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        punch_out_at = ms_to_datetime(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if punch_in_at is None:
+            validation_error(("body", "punch_in"), f"status {status} requires a punch_in")
+        if body.punch_in is not None and attendance_date(punch_in_at, emp).isoformat() != day:
+            validation_error(("body", "punch_in"), f"punch_in must fall on the attendance date {day} (R1)",
+                             body.punch_in)
+        if punch_out_at is not None and not timedelta(0) < punch_out_at - punch_in_at <= MAX_SHIFT_LENGTH:
+            validation_error(("body", "punch_out"), "punch_out must be after punch_in and within 24 hours",
+                             body.punch_out)
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            validation_error(("body",), f"status {status} clears the punch times; do not send punch_in/punch_out")
+        punch_in_at = punch_out_at = None
+
+    new = {"status": status, "punch_in": punch_in_at, "punch_out": punch_out_at,
+           **derived_fields(status, punch_in_at, punch_out_at, date.fromisoformat(day), emp)}
+    if all(new[field] == old[field] for field in CORRECTABLE_FIELDS):
+        validation_error(("body",), "the request does not change anything")
+    changes = {field: {"from": old[field], "to": new[field]} for field in TRACKED_FIELDS if new[field] != old[field]}
+    entry = {"at": datetime.now(UTC), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # Optimistic concurrency: the update only applies if the record still looks exactly as it did when we read
+    # it (same corrected fields, same number of history entries). A concurrent edit makes this match nothing,
+    # so the loser gets 409 instead of silently overwriting the winner's change or history entry.
+    guard = {"_id": record["_id"], **{field: record.get(field) for field in CORRECTABLE_FIELDS}}
+    if "history" in record:
+        guard["history"] = {"$size": len(record["history"])}
+    else:
+        guard["history"] = {"$exists": False}
+    updated = attendance.find_one_and_update(
+        guard,
+        {"$set": new, "$push": {"history": entry}},
+        projection=RECORD_PROJECTION,
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "the record was changed by another request; reload it and try again")
+    return record_out(updated)
